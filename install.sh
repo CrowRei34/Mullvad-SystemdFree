@@ -20,17 +20,24 @@
 #      doas sh mullvad-vpn-install.sh uninstall
 #      sh  mullvad-vpn-install.sh status                  # no root needed
 #
-#  Requires (host): curl, gpg, ar, tar, modprobe, install, sv/svlogd (runit).
+#  Requires (host): curl, gpg, ar, tar, mktemp, install, modprobe, sv/svlogd.
 #  Requires (network): outbound HTTPS to github.com and a keyserver.
+#
+#  v2 changes:
+#    * GPG verification is locale-independent: uses `--status-fd` machine
+#      output ([GNUPG:] VALIDSIG) instead of grepping the human-readable
+#      "Good signature" string, and pins the signing fingerprint.
+#    * DEB name/URL are computed AFTER parsing the version argument, so
+#      `install <version>` actually downloads that version.
+#    * hicolor icons are merged into the existing theme dir (no nesting).
+#    * Temp files via mktemp(1).
 # =============================================================================
 set -eu
 
 # ---- Configuration ----------------------------------------------------------
 PKGVERSION="${PKGVERSION:-2026.3}"
-DEB_NAME="MullvadVPN-${PKGVERSION}_amd64.deb"
-DEB_URL="https://github.com/mullvad/mullvadvpn-app/releases/download/${PKGVERSION}/${DEB_NAME}"
-ASC_URL="https://github.com/mullvad/mullvadvpn-app/releases/download/${PKGVERSION}/${DEB_NAME}.asc"
-# Mullvad (code signing) subkey fingerprint used to sign releases.
+# Mullvad (code signing) subkey fingerprint used to sign releases,
+# plus the fingerprint of its primary key.
 SIGN_KEY="CA83A46153BC58D69518ED49A26581F219C8314C"
 SIGN_KEY_PRIMARY="A1198702FC3E0A09A9AE5B75D5A1D4F266DE8DDF"
 KEYSERVERS="keys.openpgp.org keyserver.ubuntu.com keys.gnupg.net"
@@ -53,8 +60,15 @@ need_cmd() {
 
 # ---- Download + verify ------------------------------------------------------
 fetch_and_verify() {
-  need_cmd curl gpg ar tar
-  mkdir -p "$WORKDIR"; cd "$WORKDIR"
+  need_cmd curl gpg ar tar mktemp
+
+  # v2: computed here (not at the top) so `install <version>` overrides work.
+  DEB_NAME="MullvadVPN-${PKGVERSION}_amd64.deb"
+  DEB_URL="https://github.com/mullvad/mullvadvpn-app/releases/download/${PKGVERSION}/${DEB_NAME}"
+  ASC_URL="${DEB_URL}.asc"
+
+  mkdir -p "$WORKDIR"
+  cd "$WORKDIR"
 
   log "Downloading $DEB_NAME ..."
   curl -fsSL -o "$DEB_NAME" "$DEB_URL"
@@ -70,18 +84,44 @@ fetch_and_verify() {
       || die "Could not import signing key; cannot verify package."
   fi
 
+  # ---- v2: locale-independent signature verification ----
+  # `--status-fd=1` emits machine-readable [GNUPG:] status lines on stdout.
+  # These are NEVER localized, unlike the human-readable output
+  # ("Good signature" / "Firma correcta" / etc.).
   log "Verifying GPG signature ..."
-  gpg --verify "$DEB_NAME.asc" "$DEB_NAME" >/tmp/mullvad_gpg.$$ 2>&1 || {
-    cat /tmp/mullvad_gpg.$$ >&2; rm -f /tmp/mullvad_gpg.$$; die "Signature verification FAILED."; }
-  grep -q "Good signature" /tmp/mullvad_gpg.$$ || die "No 'Good signature' line found."
-  rm -f /tmp/mullvad_gpg.$$
-  log "Signature OK."
+  status_file="$(mktemp)"
+  if ! LC_ALL=C gpg --status-fd=1 --verify "$DEB_NAME.asc" "$DEB_NAME" \
+        >"$status_file" 2>&1; then
+    cat "$status_file" >&2
+    rm -f "$status_file"
+    die "Signature verification FAILED."
+  fi
+  # VALIDSIG format:
+  #   [GNUPG:] VALIDSIG <signing-key-fp> <date> <ts> <expire> ... <primary-fp>
+  validsig="$(grep '^\[GNUPG:\] VALIDSIG' "$status_file" || true)"
+  if [ -z "$validsig" ]; then
+    cat "$status_file" >&2
+    rm -f "$status_file"
+    die "Signature verification FAILED (no VALIDSIG status)."
+  fi
+  case "$validsig" in
+    *"$SIGN_KEY"*|*"$SIGN_KEY_PRIMARY"*)
+      rm -f "$status_file"
+      log "Signature OK (Mullvad code-signing key)."
+      ;;
+    *)
+      cat "$status_file" >&2
+      rm -f "$status_file"
+      die "Signature is valid, but NOT signed by the expected Mullvad key."
+      ;;
+  esac
 
   log "Extracting .deb ..."
-  rm -rf extract; mkdir -p extract/data
+  rm -rf extract
+  mkdir -p extract/data
   ( cd extract && ar x "../$DEB_NAME" )
   tar -xf extract/data.tar.* -C extract/data
-  STAGE="$WORKDIR/extract/data"
+  STAGE="$PWD/extract/data"
 }
 
 # ---- Install ----------------------------------------------------------------
@@ -95,7 +135,11 @@ do_install() {
   sleep 1
 
   log "[2/8] Loading WireGuard kernel module ..."
-  modprobe wireguard 2>/dev/null || warn "modprobe wireguard failed (may already be built-in)."
+  if command -v modprobe >/dev/null 2>&1; then
+    modprobe wireguard 2>/dev/null || warn "modprobe wireguard failed (may already be built-in)."
+  else
+    warn "modprobe not found; assuming wireguard is built into the kernel."
+  fi
 
   log "[3/8] Installing /opt/Mullvad VPN ..."
   rm -rf "/opt/Mullvad VPN"
@@ -110,7 +154,11 @@ do_install() {
   log "[5/8] Installing desktop entry, icons, completions ..."
   install -Dm0644 "$STAGE/usr/share/applications/mullvad-vpn.desktop" \
                     /usr/share/applications/mullvad-vpn.desktop
-  cp -a "$STAGE/usr/share/icons/hicolor" /usr/share/icons/
+  # v2: merge the deb's hicolor icons into the system theme dir.
+  #     (The old `cp -a .../hicolor /usr/share/icons/` nested the directory
+  #      as /usr/share/icons/hicolor/hicolor/ when the theme already existed.)
+  mkdir -p /usr/share/icons/hicolor
+  cp -a "$STAGE/usr/share/icons/hicolor/." /usr/share/icons/hicolor/
   install -Dm0644 "$STAGE/usr/share/bash-completion/completions/mullvad" \
                     /usr/share/bash-completion/completions/mullvad
   install -Dm0644 "$STAGE/usr/share/fish/vendor_completions.d/mullvad.fish" \
@@ -161,7 +209,9 @@ do_uninstall() {
   rm -f /usr/bin/mullvad /usr/bin/mullvad-daemon /usr/bin/mullvad-exclude \
         /usr/bin/mullvad-problem-report
   rm -f /usr/share/applications/mullvad-vpn.desktop
-  rm -rf /usr/share/icons/hicolor/apps/mullvad-vpn.png
+  # v2: cover every icon size, not just one hardcoded path.
+  rm -f /usr/share/icons/hicolor/*/apps/mullvad-vpn.png
+  rm -f /usr/share/icons/hicolor/scalable/apps/mullvad-vpn.svg
   rm -f /usr/share/bash-completion/completions/mullvad
   rm -f /usr/share/fish/vendor_completions.d/mullvad.fish
   # NOTE: /var/log/mullvad-{daemon,vpn}, /var/cache/mullvad-vpn, /etc/mullvad-vpn
@@ -188,8 +238,8 @@ Mullvad VPN installer for Void Linux (runit)
 
 Usage:
   sh $0 install [version]   Download, verify and install (default version: $PKGVERSION)
-  sh $0 uninstall            Remove binaries, service and /opt payload
-  sh $0 status               Show service + daemon status (no root needed)
+  sh $0 uninstall           Remove binaries, service and /opt payload
+  sh $0 status              Show service + daemon status (no root needed)
 
 Examples:
   doas sh $0 install          # install default version
