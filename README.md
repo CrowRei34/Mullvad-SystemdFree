@@ -18,17 +18,27 @@ y no tiene paquete nativo en los repos oficiales).
    arranque solo en cada reinicio.
 5. Carga el módulo WireGuard del kernel.
 
+En cada instalación o actualización, el script consulta la última versión
+publicada en GitHub, descarga el `.deb` correspondiente y vuelve a verificar
+su firma GPG antes de instalarlo.
+
 No instala el servicio de *early-boot blocking* ni el perfil AppArmor del
 postinst original: no son necesarios para que la VPN funcione en Void.
 
 ## Uso
 
 ```sh
-# Instalar (versión por defecto 2026.3)
+# Instalar la última versión
 doas sh ~/Documents/mullvad-vpn/install.sh install
 
 # Instalar una versión concreta
 doas sh ~/Documents/mullvad-vpn/install.sh install 2026.3
+
+# Actualizar a la última versión
+doas sh ~/Documents/mullvad-vpn/install.sh update
+
+# Actualizar a una versión concreta
+doas sh ~/Documents/mullvad-vpn/install.sh update 2026.3
 
 # Estado (no requiere root)
 sh ~/Documents/mullvad-vpn/install.sh status
@@ -56,6 +66,19 @@ cat /var/log/mullvad-daemon/current    # log en vivo
 sv status mullvad-daemon               # estado del servicio (como root)
 sv down mullvad-daemon                 # parar
 sv up mullvad-daemon                   # arrancar
+```
+
+## Actualizaciones
+
+El comando `update` no cambia la cuenta, ajustes ni logs de Mullvad. Detiene el
+daemon, verifica la nueva versión firmada, reemplaza los binarios y vuelve a
+levantar el servicio runit. Si no se indica versión, siempre usa la release más
+reciente publicada por Mullvad.
+
+Para automatizarlo con cron o un timer de runit, ejecuta periódicamente:
+
+```sh
+doas sh /ruta/al/repositorio/install.sh update
 ```
 
 ## Dependencias del host

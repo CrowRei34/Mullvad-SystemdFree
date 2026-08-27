@@ -16,12 +16,19 @@
 #  Tested on: Void Linux x86_64, kernel 7.1.1_1, runit.
 #
 #  Usage:
-#      doas sh mullvad-vpn-install.sh install [version]   # default 2026.3
+#      doas sh mullvad-vpn-install.sh install             # latest release
+#      doas sh mullvad-vpn-install.sh update             # update to latest
+#      doas sh mullvad-vpn-install.sh update [version]   # pin a version
 #      doas sh mullvad-vpn-install.sh uninstall
 #      sh  mullvad-vpn-install.sh status                  # no root needed
 #
 #  Requires (host): curl, gpg, ar, tar, mktemp, install, modprobe, sv/svlogd.
 #  Requires (network): outbound HTTPS to github.com and a keyserver.
+#
+#  v3 changes:
+#    * Resolves the latest Mullvad release automatically through the GitHub API.
+#    * Adds an `update` action; updates are verified and installed using the
+#      same signed official .deb path as a fresh installation.
 #
 #  v2 changes:
 #    * GPG verification is locale-independent: uses `--status-fd` machine
@@ -35,7 +42,8 @@
 set -eu
 
 # ---- Configuration ----------------------------------------------------------
-PKGVERSION="${PKGVERSION:-2026.3}"
+PKGVERSION="${PKGVERSION:-}"
+RELEASES_API="https://api.github.com/repos/mullvad/mullvadvpn-app/releases/latest"
 # Mullvad (code signing) subkey fingerprint used to sign releases,
 # plus the fingerprint of its primary key.
 SIGN_KEY="CA83A46153BC58D69518ED49A26581F219C8314C"
@@ -58,9 +66,24 @@ need_cmd() {
   done
 }
 
+resolve_latest_version() {
+  need_cmd curl sed
+  latest_version="$(curl -fsSL --retry 3 "$RELEASES_API" |
+    sed -n 's/^[[:space:]]*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' |
+    head -n 1)"
+  [ -n "$latest_version" ] || die "Could not determine the latest Mullvad release."
+  case "$latest_version" in
+    *[!0-9.]*|.*|*.) die "GitHub returned an invalid release tag: $latest_version" ;;
+  esac
+  PKGVERSION="$latest_version"
+  log "Latest Mullvad release: $PKGVERSION"
+}
+
 # ---- Download + verify ------------------------------------------------------
 fetch_and_verify() {
   need_cmd curl gpg ar tar mktemp
+
+  [ -n "$PKGVERSION" ] || resolve_latest_version
 
   # v2: computed here (not at the top) so `install <version>` overrides work.
   DEB_NAME="MullvadVPN-${PKGVERSION}_amd64.deb"
@@ -193,6 +216,14 @@ EOF
   log "Done. Log in with: mullvad account login <account-number> && mullvad connect"
 }
 
+# ---- Update -----------------------------------------------------------------
+do_update() {
+  need_root
+  [ -n "$PKGVERSION" ] || resolve_latest_version
+  log "Updating Mullvad VPN to $PKGVERSION ..."
+  do_install
+}
+
 # ---- Uninstall --------------------------------------------------------------
 do_uninstall() {
   need_root
@@ -237,13 +268,15 @@ show_usage() {
 Mullvad VPN installer for Void Linux (runit)
 
 Usage:
-  sh $0 install [version]   Download, verify and install (default version: $PKGVERSION)
+  sh $0 install [version]   Download, verify and install (default: latest release)
+  sh $0 update [version]    Update an existing installation (default: latest release)
   sh $0 uninstall           Remove binaries, service and /opt payload
   sh $0 status              Show service + daemon status (no root needed)
 
 Examples:
-  doas sh $0 install          # install default version
+  doas sh $0 install          # install latest release
   doas sh $0 install 2026.3   # install a specific version
+  doas sh $0 update            # update to latest release
   sh $0 status                # check current state
 
 Run as root for install/uninstall (e.g. 'doas sh $0 install').
@@ -253,6 +286,7 @@ USAGE
 # ---- Main -------------------------------------------------------------------
 case "${1:-}" in
   install)   [ $# -ge 2 ] && PKGVERSION="$2"; do_install ;;
+  update)    [ $# -ge 2 ] && PKGVERSION="$2"; do_update ;;
   uninstall) do_uninstall ;;
   status)    do_status ;;
   ""|-h|--help|help) show_usage ;;
